@@ -1,14 +1,19 @@
-use crate::read_input::run;
+use crate::chamsys::midi_through_to_chamsys;
+use crate::test::{dummy_midi_out};
 
-mod read_input;
+mod midi_io;
+mod midi_translator;
+mod notes_to_stops;
+mod test;
+mod chamsys;
 
 fn main() {
-    match run() {
+    // Currently just running the dummy program for testing
+    match dummy_midi_out() {
         Ok(_) => (),
-        Err(e) => println!("Error: {}", e),
-    }
+        Err(e) => println!("{}", e),
+    };
 }
-
 
 pub struct ProgramError {
     message: String,
