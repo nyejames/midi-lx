@@ -8,6 +8,7 @@ use crate::midi_translator::translate_midi_to_chamsys_command;
 const CHAMSYS_PORT: u16 = 6553;
 const LOCAL_IP: Ipv4Addr = Ipv4Addr::new(2, 0, 0, 1);
 const CHAMSYS_IP: Ipv4Addr = Ipv4Addr::new(2, 0, 0, 35);
+const USE_CREP: bool = false;
 
 pub fn midi_through_to_chamsys() -> Result<(), ProgramError> {
     println!("\nRUNNING CHAMSYS MIDI CONTROL");
@@ -34,19 +35,21 @@ pub fn midi_through_to_chamsys() -> Result<(), ProgramError> {
     let mut seq_forwards = 0;
     let mut seq_backwards = 0;
 
+    let mut previous_playback: u8 = 0;
+
     let _conn_in = match midi_in.connect(
         &in_port,
         "midir-read-input",
         move |stamp, message, _| {
 
             // RUN ANY INPUT TESTS IN HERE
-            let command = translate_midi_to_chamsys_command(message);
+            let command = translate_midi_to_chamsys_command(message, &mut previous_playback);
 
             match command {
                 Ok(c) => {
                     // Don't send a command if None was returned (wasteful)
                     if let Some(command) = c {
-                        match send_magicq_command(&socket, &command, true, &mut seq_forwards, &mut seq_backwards) {
+                        match send_magicq_command(&socket, &command, USE_CREP, &mut seq_forwards, &mut seq_backwards) {
                             Ok(details) => println!("{}", details),
                             Err(e) => println!("{}", e)
                         }
@@ -105,28 +108,32 @@ fn build_crep_packet(
 /// Example `command_text`: `"1A"` (activate playback 1)
 fn send_magicq_command(
     socket: &UdpSocket,
-    command_text: &str,
+    command: &str,
     use_crep: bool,
     seq_forwards: &mut u8,
     seq_backwards: &mut u8,
 ) -> Result<String, ProgramError> {
 
     let payload = if use_crep {
-        build_crep_packet(*seq_forwards, *seq_backwards, command_text.as_bytes())
+        build_crep_packet(*seq_forwards, *seq_backwards, command.as_bytes())
     } else {
-        command_text.as_bytes().to_vec()
+        // Just send raw command with terminator
+        command.as_bytes().to_vec()
     };
 
     let target = SocketAddrV4::new(CHAMSYS_IP, CHAMSYS_PORT);
 
     match socket.send_to(&payload, target) {
-        Ok(n) => {},
-        Err(e) => println!("Failed to send: {}", e),
+        Ok(_) => (),
+        Err(e) => return_err!(format!("Failed to send: {}", e))
     }
 
-    *seq_forwards = seq_forwards.wrapping_add(1);
+    if use_crep {
+        *seq_forwards = seq_forwards.wrapping_add(1);
+        *seq_backwards = seq_backwards.wrapping_add(1);
+    }
 
-    Ok(format!("Packet sent to {}: {:?}", target, &payload))
+    Ok(format!("Command '{}' sent to {}. Sequence: ({})", command, target, seq_forwards))
 }
 
 

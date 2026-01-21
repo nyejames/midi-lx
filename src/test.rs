@@ -27,7 +27,7 @@ pub fn dummy_midi_out() -> Result<(), ProgramError> {
         move |stamp, message, _| {
 
             // RUN ANY INPUT TESTS IN HERE
-            let command = translate_midi_to_chamsys_command(message);
+            let command = translate_midi_to_chamsys_command(message, &mut 0);
 
             println!("MIDI {}: {:?}", stamp, message);
 
