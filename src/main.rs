@@ -9,7 +9,7 @@ mod chamsys;
 
 fn main() {
     // Currently just running the dummy program for testing
-    match dummy_midi_out() {
+    match midi_through_to_chamsys() {
         Ok(_) => (),
         Err(e) => println!("{}", e),
     };

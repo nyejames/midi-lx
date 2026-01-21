@@ -1,153 +1,137 @@
-use std::io;
+use std::io::stdin;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
-use std::time::Duration;
 use crate::midi_io::{get_midi_input, get_midi_input_port, get_midi_output};
 use crate::{return_err, ProgramError};
 use crate::midi_translator::translate_midi_to_chamsys_command;
 
 // Default port MagicQ listens on for remote control UDP
 const CHAMSYS_PORT: u16 = 6553;
-const SOCKET_ADDR: &'static str = "127.0.0.1:3400";
-
 pub fn midi_through_to_chamsys() -> Result<(), ProgramError> {
-    println!("\nRUNNING CHAMSYS CONTROL PROGRAM");
+    println!("\nRUNNING CHAMSYS MIDI CONTROL");
     let mut conn_out = get_midi_output()?;
     let midi_in = get_midi_input()?;
     let in_port = get_midi_input_port(&midi_in)?;
 
-    // Try discovering the desk on the local network
-    match discover_desk(Duration::from_secs(2))? {
-        Some(addr) => {
-            println!("Found MagicQ at {:?}", addr);
+    let socket_address = SocketAddr::V4(SocketAddrV4::new(
+        Ipv4Addr::BROADCAST,
+        CHAMSYS_PORT,
+    ));
 
-            let mut seq = 0;
+    let socket = match open_chamsys_socket(&socket_address) {
+        Ok(s) => s,
+        Err(e) => return_err!(&format!("failed to open socket: {}", e))
+    };
 
-            let _conn_in = match midi_in.connect(
-                &in_port,
-                "midir-read-input",
-                move |stamp, message, _| {
+    let mut seq_forwards = 0;
+    let mut seq_backwards = 0;
 
-                    // RUN ANY INPUT TESTS IN HERE
-                    let command = translate_midi_to_chamsys_command(message);
+    let _conn_in = match midi_in.connect(
+        &in_port,
+        "midir-read-input",
+        move |stamp, message, _| {
 
-                    println!("MIDI {}: {:?}", stamp, message);
+            // RUN ANY INPUT TESTS IN HERE
+            let command = translate_midi_to_chamsys_command(message);
 
-                    match command {
-                        Ok(c) => {
-                            println!("Sent command: {} to Chamsys", c);
-                            send_magicq_command(&addr, c, true, seq);
-                            seq += 1;
-                        },
-                        Err(e) => {
-                            println!("Error translating MIDI to command: {}", e)
-                        },
+            println!("MIDI {}: {:?}", stamp, message);
+
+            match command {
+                Ok(c) => {
+                    println!("Sent command: {} to Chamsys", c);
+                    match send_magicq_command(&socket, &socket_address, c, true, &mut seq_forwards, &mut seq_backwards) {
+                        Ok(_) => (),
+                        Err(e) => println!("{}", e)
                     }
                 },
-                (),
-            ) {
-                Ok(connection) => connection,
-                Err(e) => return_err!(&format!("failed to connect: {}", e))
-            };
+                Err(e) => {
+                    println!("Error translating MIDI to command: {}", e)
+                },
+            }
+        },
+        (),
+    ) {
+        Ok(connection) => connection,
+        Err(e) => return_err!(&format!("failed to connect: {}", e))
+    };
 
-
-
-        }
-        None => println!("No MagicQ desk found"),
+    // Just wait for the user to press any key to exit
+    let mut input = String::new();
+    match stdin().read_line(&mut input) {
+        Ok(_) => (),
+        Err(e) => return_err!(format!("failed to read line from stdin: {e}")),
     }
 
     Ok(())
 }
 
 // Builds a very simple CREP packet
-fn build_crep_packet(seq: u8, data_bytes: &[u8]) -> Vec<u8> {
-    let mut buf = Vec::new();
+fn build_crep_packet(
+    seq_fwd: u8,
+    seq_bkwd: u8,
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut packet = Vec::with_capacity(10 + payload.len());
 
-    // CREP header (Little endian representation on the wire)
-    // 'C' 'R' 'E' 'P' as bytes
-    buf.extend_from_slice(b"CREP");
+    // Magic
+    packet.extend_from_slice(b"CREP");
 
-    // version = 0
-    buf.extend_from_slice(&0u16.to_le_bytes());
+    // Version (u16, BE) — always zero
+    packet.extend_from_slice(&0u16.to_be_bytes());
 
-    // fwd sequence
-    buf.push(seq);
+    // Sequence numbers
+    packet.push(seq_fwd);
+    packet.push(seq_bkwd);
 
-    // bkwd sequence (we don't expect responses here, so 0)
-    buf.push(0);
+    // Payload length (u16, BE)
+    packet.extend_from_slice(&(payload.len() as u16).to_be_bytes());
 
-    // length of the data
-    buf.extend_from_slice(&(data_bytes.len() as u16).to_le_bytes());
+    // Payload
+    packet.extend_from_slice(payload);
 
-    // the actual data
-    buf.extend_from_slice(data_bytes);
-
-    buf
+    packet
 }
 
-/// Try to find a MagicQ on the local network
-///
-/// Binds to "0.0.0.0:0", sets broadcast, and sends an empty packet that prompts
-/// the desk to respond (if any implementation does).
-///
-/// Returns the first responding address or error.
-fn discover_desk(timeout: Duration) -> Result<Option<SocketAddr>, ProgramError> {
-    let socket = match UdpSocket::bind(SOCKET_ADDR) {
-        Ok(s) => s,
-        Err(e) => return_err!(format!("failed to bind socket: {}", e)),
-    };
+fn open_chamsys_socket(socket_address: &SocketAddr) -> Result<UdpSocket, ProgramError> {
+    let socket = UdpSocket::bind(socket_address)
+        .map_err(|e| ProgramError::new(format!(
+            "failed to bind socket: {e}"
+        )))?;
 
-    match socket.set_broadcast(true) {
-        Ok(_) => (),
-        Err(e) => return_err!(format!("failed to set broadcast: {}", e)),
-    }
+    socket.set_broadcast(true)
+        .map_err(|e| ProgramError::new(format!(
+            "failed to enable broadcast: {e}"
+        )))?;
 
-    match socket.set_read_timeout(Some(timeout)) {
-        Ok(_) => (),
-        Err(e) => return_err!(format!("failed to set read timeout: {}", e)),
-    }
+    // Optional: non-blocking if you later want recv()
+    // socket.set_nonblocking(true)?;
 
-    // We can send an (empty or simple request) to broadcast
-    let broadcast_addr = SocketAddrV4::new(Ipv4Addr::BROADCAST, CHAMSYS_PORT);
-
-    let _ = match socket.send_to(b"", broadcast_addr) {
-        Ok(r) => r,
-        Err(e) => return_err!(format!("failed to send broadcast: {}", e)),
-    };
-
-    let mut buf = [0u8; 2048];
-    match socket.recv_from(&mut buf) {
-        Ok((_, addr)) => Ok(Some(addr)),
-        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
-        Err(e) => Err(ProgramError::new(format!("Error with receiving the socket: {e}"))),
-    }
+    Ok(socket)
 }
 
 /// Sends a formatted command (optionally with CREP header)
 ///
 /// Example `command_text`: `"1A"` (activate playback 1)
 fn send_magicq_command(
-    desk_addr: &SocketAddr,
+    socket: &UdpSocket,
+    target: &SocketAddr,
     command_text: &str,
     use_crep: bool,
-    seq: u8,
+    seq_forwards: &mut u8,
+    seq_backwards: &mut u8,
 ) -> Result<(), ProgramError> {
-    let socket = match UdpSocket::bind(SOCKET_ADDR) {
-        Ok(s) => s,
-        Err(e) => return_err!(format!("failed to bind socket: {}", e)),
-    };
-
-    let bytes = command_text.as_bytes();
 
     let payload = if use_crep {
-        build_crep_packet(seq, bytes)
+        build_crep_packet(*seq_forwards, *seq_backwards, command_text.as_bytes())
     } else {
-        bytes.to_vec()
+        command_text.as_bytes().to_vec()
     };
 
-    match socket.send_to(&payload, desk_addr) {
-        Ok(_) => (),
-        Err(e) => return_err!(format!("failed to send command: {}", e)),
-    }
+    socket.send_to(&payload, target)
+        .map_err(|e| ProgramError::new(format!(
+            "failed to send command: {e}"
+        )))?;
+
+    *seq_forwards = seq_forwards.wrapping_add(1);
 
     Ok(())
 }
