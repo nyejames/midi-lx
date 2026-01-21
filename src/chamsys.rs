@@ -6,20 +6,29 @@ use crate::midi_translator::translate_midi_to_chamsys_command;
 
 // Default port MagicQ listens on for remote control UDP
 const CHAMSYS_PORT: u16 = 6553;
+const LOCAL_IP: Ipv4Addr = Ipv4Addr::new(2, 0, 0, 1);
+const CHAMSYS_IP: Ipv4Addr = Ipv4Addr::new(2, 0, 0, 35);
+
 pub fn midi_through_to_chamsys() -> Result<(), ProgramError> {
     println!("\nRUNNING CHAMSYS MIDI CONTROL");
     let mut conn_out = get_midi_output()?;
     let midi_in = get_midi_input()?;
     let in_port = get_midi_input_port(&midi_in)?;
 
-    let socket_address = SocketAddr::V4(SocketAddrV4::new(
-        Ipv4Addr::BROADCAST,
-        CHAMSYS_PORT,
-    ));
+    println!("Local IP for sending: {}", LOCAL_IP);
 
-    let socket = match open_chamsys_socket(&socket_address) {
+    // Try pinging the desk
+    if let Ok(_) = std::process::Command::new("ping")
+        .arg("2.0.0.35")
+        .output() {
+        println!("Ping to 2.0.0.35 succeeded");
+    } else {
+        println!("Ping failed — network config may be wrong");
+    }
+
+    let socket = match UdpSocket::bind((LOCAL_IP, 0)) {
         Ok(s) => s,
-        Err(e) => return_err!(&format!("failed to open socket: {}", e))
+        Err(e) => return_err!(format!("failed to bind socket: {}", e))
     };
 
     let mut seq_forwards = 0;
@@ -33,14 +42,14 @@ pub fn midi_through_to_chamsys() -> Result<(), ProgramError> {
             // RUN ANY INPUT TESTS IN HERE
             let command = translate_midi_to_chamsys_command(message);
 
-            println!("MIDI {}: {:?}", stamp, message);
-
             match command {
                 Ok(c) => {
-                    println!("Sent command: {} to Chamsys", c);
-                    match send_magicq_command(&socket, &socket_address, c, true, &mut seq_forwards, &mut seq_backwards) {
-                        Ok(_) => (),
-                        Err(e) => println!("{}", e)
+                    // Don't send a command if None was returned (wasteful)
+                    if let Some(command) = c {
+                        match send_magicq_command(&socket, &command, true, &mut seq_forwards, &mut seq_backwards) {
+                            Ok(details) => println!("{}", details),
+                            Err(e) => println!("{}", e)
+                        }
                     }
                 },
                 Err(e) => {
@@ -91,34 +100,16 @@ fn build_crep_packet(
     packet
 }
 
-fn open_chamsys_socket(socket_address: &SocketAddr) -> Result<UdpSocket, ProgramError> {
-    let socket = UdpSocket::bind(socket_address)
-        .map_err(|e| ProgramError::new(format!(
-            "failed to bind socket: {e}"
-        )))?;
-
-    socket.set_broadcast(true)
-        .map_err(|e| ProgramError::new(format!(
-            "failed to enable broadcast: {e}"
-        )))?;
-
-    // Optional: non-blocking if you later want recv()
-    // socket.set_nonblocking(true)?;
-
-    Ok(socket)
-}
-
 /// Sends a formatted command (optionally with CREP header)
 ///
 /// Example `command_text`: `"1A"` (activate playback 1)
 fn send_magicq_command(
     socket: &UdpSocket,
-    target: &SocketAddr,
     command_text: &str,
     use_crep: bool,
     seq_forwards: &mut u8,
     seq_backwards: &mut u8,
-) -> Result<(), ProgramError> {
+) -> Result<String, ProgramError> {
 
     let payload = if use_crep {
         build_crep_packet(*seq_forwards, *seq_backwards, command_text.as_bytes())
@@ -126,14 +117,16 @@ fn send_magicq_command(
         command_text.as_bytes().to_vec()
     };
 
-    socket.send_to(&payload, target)
-        .map_err(|e| ProgramError::new(format!(
-            "failed to send command: {e}"
-        )))?;
+    let target = SocketAddrV4::new(CHAMSYS_IP, CHAMSYS_PORT);
+
+    match socket.send_to(&payload, target) {
+        Ok(n) => {},
+        Err(e) => println!("Failed to send: {}", e),
+    }
 
     *seq_forwards = seq_forwards.wrapping_add(1);
 
-    Ok(())
+    Ok(format!("Packet sent to {}: {:?}", target, &payload))
 }
 
 

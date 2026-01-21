@@ -33,7 +33,11 @@ pub fn dummy_midi_out() -> Result<(), ProgramError> {
 
             match command {
                 Ok(c) => {
-                    println!("COMMAND: {}", c);
+                    if let Some(c) = c {
+                        println!("COMMAND: {}", c);
+                    } else {
+                        println!("No command set for this MIDI input");
+                    }
                 },
                 Err(e) => {
                     println!("Error translating MIDI to command: {}", e)
