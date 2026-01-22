@@ -1,7 +1,8 @@
 [package]
-name = "organ-midi"
+name = "midi_lx"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+color-print = "0.3.7"
 midir = "0.10.3"

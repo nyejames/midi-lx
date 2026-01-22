@@ -1,8 +1,9 @@
 use std::io::stdin;
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
+use color_print::cprintln;
 use crate::midi_io::{get_midi_input, get_midi_input_port, get_midi_output};
 use crate::errors::ProgramError;
-use crate::midi_translator::translate_midi_to_chamsys_command;
+use crate::midi_utils::{is_off_status, is_on_status};
 use crate::return_err;
 
 // Default port MagicQ listens on for remote control UDP
@@ -12,7 +13,7 @@ const CHAMSYS_IP: Ipv4Addr = Ipv4Addr::new(2, 0, 0, 35);
 const USE_CREP: bool = false;
 
 pub fn midi_through_to_chamsys() -> Result<(), ProgramError> {
-    println!("\nRUNNING CHAMSYS MIDI CONTROL");
+    cprintln!("\n<green>RUNNING CHAMSYS MIDI CONTROL</>");
     let mut conn_out = get_midi_output()?;
     let midi_in = get_midi_input()?;
     let in_port = get_midi_input_port(&midi_in)?;
@@ -75,6 +76,63 @@ pub fn midi_through_to_chamsys() -> Result<(), ProgramError> {
     }
 
     Ok(())
+}
+
+pub fn translate_midi_to_chamsys_command(message: &[u8], previous_playback: &mut u8) -> Result<Option<String>, ProgramError> {
+    // MIDI note number for the first note that will control PB1 on the desk
+    let first_playback_note = 48;
+
+    // Get the note value of the message
+    let note = match message.get(1) {
+        Some(n) => *n,
+        None => return_err!("message does not contain a note value")
+    };
+
+    let status = match message.get(0) {
+        Some(s) => *s,
+        None => return_err!("message does not contain a status byte")
+    };
+
+    let velocity = match message.get(2) {
+        Some(v) => *v,
+        None => return_err!("message does not contain a velocity value")
+    };
+
+    // Important Status messages
+    println!("MIDI input: {:?}", message);
+
+    let command_letter: &str;
+
+    // Note on for all channels
+    if is_on_status(status)  {
+        command_letter = "A";
+
+    // Note off for all channels
+    } else if is_off_status(status) {
+        command_letter = "R";
+
+    // MOD WHEEL (LOL)
+    } else if status == 176 {
+        return Ok(Some(format!("{},{}L", previous_playback, velocity)))
+    } else {
+        // If this status isn't set as a command yet
+        println!("Status {} not set as a command", status);
+        return Ok(None);
+    }
+
+    // If is just regular note status, fill in playback info and command
+
+    // To make sure it doesn't try to use negative playback numbers (u8 overflow panic)
+    if note < first_playback_note { return Ok(None) }
+
+    // Convert the note value to a Chamsys playback
+    let playback_number = (note - first_playback_note + 1);
+
+    // Update which playback is currently playing
+    *previous_playback = playback_number;
+
+    // Send back the formatted command
+    Ok(Some(format!("{}{}", playback_number, command_letter)))
 }
 
 // Builds a very simple CREP packet

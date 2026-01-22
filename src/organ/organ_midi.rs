@@ -27,9 +27,96 @@ F0-2B-01-01-22/23-nn-nn-F7
 23 = Stop On
 nn-nn = internal stop number
 
- */
+*/
+use std::io::stdin;
+use color_print::cprintln;
+use crate::errors::ProgramError;
+use crate::midi_io::{get_midi_input, get_midi_input_port, get_midi_output};
+use crate::midi_utils::{is_on_status, status_channel};
+use crate::organ::stops_table::{OrganStop, TOTAL_STOPS};
+use crate::return_err;
 
-use crate::organ::stops_table::OrganStop;
+// Some test bindings of MIDI notes
+pub fn play_organ(control_stops: bool) -> Result<(), ProgramError> {
+    cprintln!("\n<green>RUNNING ORGAN MIDI CONTROL</>");
+
+    let mut conn_out = get_midi_output()?;
+    let midi_in = get_midi_input()?;
+    let in_port = get_midi_input_port(&midi_in)?;
+
+    let _conn_in = match midi_in.connect(
+        &in_port,
+        "midir-read-input",
+        move |stamp, message, _| {
+            let midi_message = midi_to_organ_note(message, control_stops);
+
+            println!("MIDI message received: {:?}", message);
+
+            if message != midi_message {
+                println!("MIDI message converted: {:?}", midi_message);
+            }
+
+            // Pass this midi message through to the output
+            let _ = conn_out.send(&midi_message);
+        },
+        (),
+    ) {
+        Ok(connection) => connection,
+        Err(e) => return_err!(&format!("failed to connect: {}", e))
+    };
+
+    // Just wait for the user to press a key, other than the exit button to exit
+    let mut input = String::new();
+    match stdin().read_line(&mut input) {
+        Ok(_) => (),
+        Err(e) => return_err!(format!("failed to read line from stdin: {e}")),
+    }
+
+    Ok(())
+}
+
+// Converts the MIDI note to an organ MIDI note
+// This translates certain MIDI info to Sysex Commands for stops,
+// And converts velocity data to expression data instead (organ ignored velocity)
+const TEMP_ORGAN_STOP_CHANNEL: u8 = 2;
+
+pub fn midi_to_organ_note(message: &[u8], control_stops: bool) -> Vec<u8> {
+    let mut converted_midi_message = message.to_vec();
+
+    let note_number = match message.get(1) {
+        Some(note) => *note,
+        None => return converted_midi_message,
+    };
+
+    let status = match message.get(0) {
+        Some(status) => *status,
+        None => return converted_midi_message,
+    };
+
+    // For testing, we will arbitrarily turn certain notes into Sysex stop commands
+    // Later, the user will configure these in the UI
+    // We are just going to directly use the MIDI note number as the stop number
+    // Lowest note on the keyboard is usually 0, so the stop numbers will start from there
+    // If control_stops is false, then a normal midi note will be played from the keyboard instead.
+
+    // Return a note converted to an organ Sysex message
+    if note_number < TOTAL_STOPS && control_stops {
+        // Convert the MIDI note to an organ stop number
+        let stop_number = match OrganStop::from_u8(note_number) {
+            Some(stop) => stop,
+            None => return converted_midi_message,
+        };
+
+        let on = is_on_status(status);
+
+        return organ_stop_to_sysex(stop_number, on)
+    }
+
+    // Otherwise just pass the MIDI data through
+    // Could do weird stuff like convert velocity to expression data for the organ,
+    // but I'm sure organists would hate this.
+    converted_midi_message
+}
 
 pub fn sysex_to_organ_stop(sysex_message: &[u8]) -> Option<OrganStop> {
 
@@ -42,7 +129,7 @@ pub fn sysex_to_organ_stop(sysex_message: &[u8]) -> Option<OrganStop> {
 
     // Only need the second number as the first is always 0
     match sysex_message.get(6) {
-        Some(stop_number) => ,
+        Some(stop_number) => OrganStop::from_u8(*stop_number),
         None => None
     }
 

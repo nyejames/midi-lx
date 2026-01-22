@@ -1,6 +1,6 @@
 pub mod errors;
 mod midi_io;
-mod midi_translator;
+mod midi_utils;
 mod test;
 mod chamsys;
 
