@@ -1,6 +1,7 @@
 use std::io::{stdin, stdout, Write};
-use crate::{return_err, ProgramError};
+use crate::errors::ProgramError;
 use midir::*;
+use crate::return_err;
 
 pub fn get_midi_input() -> Result<MidiInput, ProgramError> {
     // Create the MIDI input

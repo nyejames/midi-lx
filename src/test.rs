@@ -1,9 +1,10 @@
 use std::io::stdin;
 use std::thread::sleep;
 use std::time::Duration;
-use crate::{return_err, ProgramError};
+use crate::errors::ProgramError;
 use crate::midi_io::{get_midi_input, get_midi_input_port, get_midi_output};
 use crate::midi_translator::translate_midi_to_chamsys_command;
+use crate::return_err;
 
 pub fn dummy_midi_out() -> Result<(), ProgramError> {
     println!("\nRUNNING TEST PROGRAM");
