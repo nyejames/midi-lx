@@ -1,66 +1,67 @@
-use std::io::stdin;
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
-use color_print::cprintln;
-use crate::midi_io::{get_midi_input, get_midi_input_port, get_midi_output};
+use color_print::{ceprintln, cprintln};
 use crate::errors::ProgramError;
 use crate::midi_utils::{is_off_status, is_on_status};
-use crate::return_err;
+use crate::{return_err, LxCommand, MidiRuntime};
+use std::sync::mpsc;
+use midir::{MidiInput, MidiInputPort, MidiOutputConnection};
 
-// Default port MagicQ listens on for remote control UDP
+/// Default port MagicQ listens on for remote control UDP
 const CHAMSYS_PORT: u16 = 6553;
-const LOCAL_IP: Ipv4Addr = Ipv4Addr::new(2, 0, 0, 1);
-const CHAMSYS_IP: Ipv4Addr = Ipv4Addr::new(2, 0, 0, 35);
-const USE_CREP: bool = false;
 
-pub fn midi_through_to_chamsys() -> Result<(), ProgramError> {
+pub struct AppState {
+    desk_ip: Ipv4Addr,
+
+    // Should not change while running the runtime (hopefully)
+    app_ip: Ipv4Addr,
+
+    mappings: HashMap<usize, LxCommand>,
+    previous_playback: u8,
+}
+
+impl AppState {
+    pub fn new(desk_ip: Ipv4Addr, app_ip: Ipv4Addr) -> Self {
+        Self {
+            desk_ip,
+            app_ip,
+            mappings: HashMap::new(),
+            previous_playback: 0,
+        }
+    }
+}
+
+pub enum AppEvent {
+    Midi(Vec<u8>),
+    UpdateMappings(HashMap<usize, LxCommand>),
+    SetDeskIp(Ipv4Addr),
+    Stop,
+}
+
+pub fn start_midi_to_chamsys_runtime(state: AppState, midi_input: MidiInput, selected_midi_port: MidiInputPort, midi_through: Option<MidiOutputConnection>) -> Result<MidiRuntime, ProgramError> {
     cprintln!("\n<green>RUNNING CHAMSYS MIDI CONTROL</>");
-    let mut conn_out = get_midi_output()?;
-    let midi_in = get_midi_input()?;
-    let in_port = get_midi_input_port(&midi_in)?;
+    let (tx, rx) = mpsc::channel::<AppEvent>();
 
-    println!("Local IP for sending: {}", LOCAL_IP);
+    // MIDI prep
+    let tx_midi = tx.clone();
+
+    println!("Local IP for sending: {}", state.app_ip);
 
     // Try pinging the desk
     if let Ok(_) = std::process::Command::new("ping")
-        .arg("2.0.0.35")
+        .arg(state.desk_ip.to_string())
         .output() {
         println!("Ping to 2.0.0.35 succeeded");
     } else {
         println!("Ping failed — network config may be wrong");
     }
 
-    let socket = match UdpSocket::bind((LOCAL_IP, 0)) {
-        Ok(s) => s,
-        Err(e) => return_err!(format!("failed to bind socket: {}", e))
-    };
-
-    let mut seq_forwards = 0;
-    let mut seq_backwards = 0;
-
-    let mut previous_playback: u8 = 0;
-
-    let _conn_in = match midi_in.connect(
-        &in_port,
+    // MIDI INPUTS MESSAGE PASSING
+    let _conn_in = match midi_input.connect(
+        &selected_midi_port,
         "midir-read-input",
-        move |stamp, message, _| {
-
-            // RUN ANY INPUT TESTS IN HERE
-            let command = translate_midi_to_chamsys_command(message, &mut previous_playback);
-
-            match command {
-                Ok(c) => {
-                    // Don't send a command if None was returned (wasteful)
-                    if let Some(command) = c {
-                        match send_magicq_command(&socket, &command, USE_CREP, &mut seq_forwards, &mut seq_backwards) {
-                            Ok(details) => println!("{}", details),
-                            Err(e) => println!("{}", e)
-                        }
-                    }
-                },
-                Err(e) => {
-                    println!("Error translating MIDI to command: {}", e)
-                },
-            }
+        move |_stamp, message, _| {
+            let _ = tx_midi.send(AppEvent::Midi(message.to_vec()));
         },
         (),
     ) {
@@ -68,17 +69,59 @@ pub fn midi_through_to_chamsys() -> Result<(), ProgramError> {
         Err(e) => return_err!(&format!("failed to connect: {}", e))
     };
 
-    // Just wait for the user to press any key to exit
-    let mut input = String::new();
-    match stdin().read_line(&mut input) {
-        Ok(_) => (),
-        Err(e) => return_err!(format!("failed to read line from stdin: {e}")),
-    }
+    // Spawn the event loop
+    std::thread::spawn(move || {
+        run_event_loop(state, rx);
+    });
 
-    Ok(())
+    Ok(MidiRuntime { tx })
 }
 
-pub fn translate_midi_to_chamsys_command(message: &[u8], previous_playback: &mut u8) -> Result<Option<String>, ProgramError> {
+fn run_event_loop(
+    mut state: AppState,
+    rx: mpsc::Receiver<AppEvent>,
+) {
+    let socket = match UdpSocket::bind((state.app_ip, 0)) {
+        Ok(s) => s,
+        Err(e) => {
+            ceprintln!("<red>Failed to Bind Socket: {}</>", e);
+            return
+        }
+    };
+
+    loop {
+        match rx.recv() {
+            Ok(AppEvent::Midi(message)) => {
+                if let Ok(Some(cmd)) =
+                    translate_midi_to_chamsys_command(
+                        &message,
+                        &mut state,
+                    )
+                {
+                    match send_magicq_command(&socket, &cmd, &state) {
+                        Ok(details) => println!("{}", details),
+                        Err(e) => println!("{}", e)
+                    }
+                }
+            }
+
+            Ok(AppEvent::UpdateMappings(new_mappings)) => {
+                state.mappings = new_mappings;
+            }
+
+            Ok(AppEvent::SetDeskIp(ip)) => {
+                state.desk_ip = ip;
+            }
+
+            Ok(AppEvent::Stop) | Err(_) => {
+                break;
+            }
+        }
+    }
+}
+
+/// Formats a command formatted for Chamsys desks in rx (no header) mode
+pub fn translate_midi_to_chamsys_command(message: &[u8], state: &mut AppState) -> Result<Option<String>, ProgramError> {
     // MIDI note number for the first note that will control PB1 on the desk
     let first_playback_note = 48;
 
@@ -113,7 +156,7 @@ pub fn translate_midi_to_chamsys_command(message: &[u8], previous_playback: &mut
 
     // MOD WHEEL (LOL)
     } else if status == 176 {
-        return Ok(Some(format!("{},{}L", previous_playback, velocity)))
+        return Ok(Some(format!("{},{}L", state.previous_playback, velocity)))
     } else {
         // If this status isn't set as a command yet
         println!("Status {} not set as a command", status);
@@ -129,70 +172,25 @@ pub fn translate_midi_to_chamsys_command(message: &[u8], previous_playback: &mut
     let playback_number = (note - first_playback_note + 1);
 
     // Update which playback is currently playing
-    *previous_playback = playback_number;
+    state.previous_playback = playback_number;
 
     // Send back the formatted command
     Ok(Some(format!("{}{}", playback_number, command_letter)))
 }
 
-// Builds a very simple CREP packet
-fn build_crep_packet(
-    seq_fwd: u8,
-    seq_bkwd: u8,
-    payload: &[u8],
-) -> Vec<u8> {
-    let mut packet = Vec::with_capacity(10 + payload.len());
-
-    // Magic
-    packet.extend_from_slice(b"CREP");
-
-    // Version (u16, BE) — always zero
-    packet.extend_from_slice(&0u16.to_be_bytes());
-
-    // Sequence numbers
-    packet.push(seq_fwd);
-    packet.push(seq_bkwd);
-
-    // Payload length (u16, BE)
-    packet.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-
-    // Payload
-    packet.extend_from_slice(payload);
-
-    packet
-}
-
-/// Sends a formatted command (optionally with CREP header)
-///
-/// Example `command_text`: `"1A"` (activate playback 1)
 fn send_magicq_command(
     socket: &UdpSocket,
     command: &str,
-    use_crep: bool,
-    seq_forwards: &mut u8,
-    seq_backwards: &mut u8,
+    state: &AppState,
 ) -> Result<String, ProgramError> {
+    let target = SocketAddrV4::new(state.desk_ip, CHAMSYS_PORT);
 
-    let payload = if use_crep {
-        build_crep_packet(*seq_forwards, *seq_backwards, command.as_bytes())
-    } else {
-        // Just send raw command with terminator
-        command.as_bytes().to_vec()
-    };
-
-    let target = SocketAddrV4::new(CHAMSYS_IP, CHAMSYS_PORT);
-
-    match socket.send_to(&payload, target) {
+    match socket.send_to(&command.as_bytes().to_vec(), target) {
         Ok(_) => (),
         Err(e) => return_err!(format!("Failed to send: {}", e))
     }
 
-    if use_crep {
-        *seq_forwards = seq_forwards.wrapping_add(1);
-        *seq_backwards = seq_backwards.wrapping_add(1);
-    }
-
-    Ok(format!("Command '{}' sent to {}. Sequence: ({})", command, target, seq_forwards))
+    Ok(format!("Command '{}' sent to {}", command, target))
 }
 
 

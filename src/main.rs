@@ -1,4 +1,4 @@
-use midi_lx::cli::run_cli;
+use midilx::cli::run_cli;
 
 fn main() {
     run_cli();

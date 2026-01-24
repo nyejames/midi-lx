@@ -6,3 +6,7 @@ edition = "2024"
 [dependencies]
 color-print = "0.3.7"
 midir = "0.10.3"
+
+[lib]
+name = "midilx"
+path = "src/lib.rs"

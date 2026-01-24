@@ -1,8 +1,9 @@
 use std::env;
+use std::net::Ipv4Addr;
 use color_print::{ceprintln, cprintln};
-
+use crate::midi_io::{get_midi_input, get_midi_input_port};
 use crate::test::{dummy_midi_out};
-use crate::chamsys::midi_through_to_chamsys;
+use crate::MidiRuntime;
 use crate::organ::organ_midi::play_organ;
 
 enum Command {
@@ -45,9 +46,32 @@ pub fn run_cli() {
             };
         },
 
+        // Currently just running the dummy program for testing
         Command::ChamsysMIDI => {
-            // Currently just running the dummy program for testing
-            match midi_through_to_chamsys() {
+            let midi_input = match get_midi_input() {
+                Ok(i) => i,
+                Err(e) => {
+                    ceprintln!("<red>{}</>", e);
+                    return
+                },
+            };
+
+            let selected_midi_port = match get_midi_input_port(&midi_input) {
+                Ok(p) => p,
+                Err(e) => {
+                    ceprintln!("<red>{}</>", e);
+                    return
+                },
+            };
+
+            match MidiRuntime::create(
+                // TEMP DEFAULTS FOR TESTING
+                Ipv4Addr::new(2, 0, 0, 35),
+                Ipv4Addr::new(2, 0, 0, 1),
+                midi_input,
+                selected_midi_port,
+                None,
+            ) {
                 Ok(_) => (),
                 Err(e) => {
                     ceprintln!("<red>{}</>", e)
